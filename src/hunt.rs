@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 // https://github.com/rust-lang/rust/issues/74465
 use once_cell::sync::OnceCell;
@@ -28,6 +28,7 @@ use crate::file::{Document as File, Kind as FileKind, Reader};
 use crate::rule::{
     Aggregate, Filter, Kind as RuleKind, Rule,
     chainsaw::{Container, Field, Format},
+    sigma::{Correlation, CorrelationType},
 };
 use crate::value::Value;
 
@@ -434,6 +435,7 @@ impl HunterBuilder {
                             }
                             s.tau.detection.expression =
                                 crate::ext::tau::update_fields(s.tau.detection.expression, &lookup);
+                            s.remap_checks(&lookup);
                             Rule::Sigma(s)
                         }
                     };
@@ -485,11 +487,51 @@ impl HunterBuilder {
             }
         }
 
+        let correlations = rules
+            .iter()
+            .filter_map(|(id, rule)| {
+                let Rule::Sigma(rule) = rule else {
+                    return None;
+                };
+                let correlation = rule.correlation.clone()?;
+                let mut targets = Vec::with_capacity(correlation.rules.len());
+                for reference in &correlation.rules {
+                    let target = rules.iter().find_map(|(id, rule)| {
+                        let Rule::Sigma(rule) = rule else {
+                            return None;
+                        };
+                        if rule.correlation.is_some() {
+                            return None;
+                        }
+                        if rule.name == *reference || rule.id.as_deref() == Some(reference) {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    });
+                    match target {
+                        Some(target) => targets.push(target),
+                        None => cs_debug!(
+                            "[*] Correlation rule '{}' references unknown rule '{}'",
+                            rule.name,
+                            reference
+                        ),
+                    }
+                }
+                Some(CorrelationHunt {
+                    id: *id,
+                    correlation,
+                    targets,
+                })
+            })
+            .collect();
+
         Ok(Hunter {
             inner: HunterInner {
                 hunts,
                 fields,
                 rules,
+                correlations,
 
                 from,
                 load_unknown,
@@ -723,7 +765,10 @@ impl TauDocument for Cache<'_> {
         if let Some(cache) = &self.cache {
             cs_trace!("[*] Using cache for key lookup - {}", key);
             let index = key.bytes().fold(0, |acc, x| acc + (x as usize));
-            cache[index].clone()
+            match cache.get(index) {
+                Some(value) => value.clone(),
+                None => self.mapped.find(key),
+            }
         } else {
             self.mapped.find(key)
         }
@@ -740,6 +785,22 @@ pub struct Hunt {
     pub file: FileKind,
 }
 
+#[derive(Clone)]
+struct CorrelationHunt {
+    id: Uuid,
+    correlation: Correlation,
+    targets: Vec<Uuid>,
+}
+
+#[derive(Clone)]
+struct CorrelationEvent {
+    rule: Uuid,
+    hunt: Uuid,
+    document: Uuid,
+    timestamp: NaiveDateTime,
+    value: Option<String>,
+}
+
 impl Hunt {
     pub fn is_aggregation(&self) -> bool {
         match &self.kind {
@@ -753,6 +814,7 @@ pub struct HunterInner {
     hunts: Vec<Hunt>,
     fields: Vec<String>,
     rules: BTreeMap<Uuid, Rule>,
+    correlations: Vec<CorrelationHunt>,
 
     load_unknown: bool,
     preprocess: bool,
@@ -788,6 +850,8 @@ impl Hunter {
         let aggregates: Mutex<
             FxHashMap<(Uuid, Uuid), (&Aggregate, FxHashMap<u64, Vec<Uuid>>)>,
         > = Mutex::new(FxHashMap::default());
+        let correlation_events: Mutex<FxHashMap<(Uuid, u64), Vec<CorrelationEvent>>> =
+            Mutex::new(FxHashMap::default());
         let files: Mutex<FxHashMap<Uuid, (Value, NaiveDateTime)>> =
             Mutex::new(FxHashMap::default());
         let offset = Mutex::new(0);
@@ -935,6 +999,49 @@ impl Hunter {
                                     })
                                     .collect::<Vec<(_, _)>>();
                                 for (rid, rule) in matches {
+                                    for correlation in &self.inner.correlations {
+                                        if !correlation.targets.contains(rid) {
+                                            continue;
+                                        }
+                                        let mut hasher = FxHasher::default();
+                                        let mut valid = true;
+                                        for field in &correlation.correlation.group_by {
+                                            match mapped.find(field).and_then(|s| s.to_string()) {
+                                                Some(value) => value.hash(&mut hasher),
+                                                None => {
+                                                    valid = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if !valid {
+                                            continue;
+                                        }
+                                        let condition_value = correlation
+                                            .correlation
+                                            .condition
+                                            .as_ref()
+                                            .and_then(|condition| condition.field.as_ref())
+                                            .and_then(|field| {
+                                                mapped.find(field).and_then(|s| s.to_string())
+                                            });
+                                        let key = hasher.finish();
+                                        let mut events = correlation_events
+                                            .lock()
+                                            .expect("could not lock correlation events");
+                                        events.entry((correlation.id, key)).or_default().push(
+                                            CorrelationEvent {
+                                                rule: *rid,
+                                                hunt: hunt.id,
+                                                document: document_id,
+                                                timestamp,
+                                                value: condition_value,
+                                            },
+                                        );
+                                        let mut files =
+                                            files.lock().expect("could not lock files");
+                                        files.insert(document_id, (value.clone(), timestamp));
+                                    }
                                     if let Some(aggregate) = &rule.aggregate() {
                                         let mut files = files.lock().expect("could not lock files");
                                         files.insert(document_id, (value.clone(), timestamp));
@@ -1058,6 +1165,9 @@ impl Hunter {
             })
             .collect::<crate::Result<Vec<Detections>>>()?;
         let aggregates = aggregates.into_inner().expect("could not lock aggregates");
+        let correlation_events = correlation_events
+            .into_inner()
+            .expect("could not lock correlation events");
         let files = files.into_inner().expect("could not lock aggregates");
         for ((hid, rid), (aggregate, docs)) in aggregates {
             for ids in docs.values() {
@@ -1098,6 +1208,55 @@ impl Hunter {
                     });
                 }
             }
+        }
+        for ((correlation_id, _), events) in correlation_events {
+            let correlation = match self
+                .inner
+                .correlations
+                .iter()
+                .find(|correlation| correlation.id == correlation_id)
+            {
+                Some(correlation) => correlation,
+                None => continue,
+            };
+            let selected = match evaluate_correlation(correlation, events) {
+                Some(selected) => selected,
+                None => continue,
+            };
+            let mut documents = Vec::new();
+            let mut seen = HashSet::new();
+            let mut timestamp = None;
+            for event in &selected {
+                timestamp = Some(match timestamp {
+                    Some(timestamp) if timestamp < event.timestamp => timestamp,
+                    _ => event.timestamp,
+                });
+                if !seen.insert(event.document) {
+                    continue;
+                }
+                let (value, _) = files
+                    .get(&event.document)
+                    .expect("could not get correlation document");
+                documents.push(Document {
+                    kind: kind.clone(),
+                    path: file,
+                    data: bincode::serde::encode_to_vec(value, bincode::config::standard())?,
+                });
+            }
+            if documents.is_empty() {
+                continue;
+            }
+            detections.push(Detections {
+                hits: smallvec::smallvec![Hit {
+                    hunt: selected
+                        .first()
+                        .expect("correlation selection is empty")
+                        .hunt,
+                    rule: correlation_id,
+                    timestamp: timestamp.expect("correlation has no timestamp"),
+                }],
+                kind: Kind::Aggregate { documents },
+            });
         }
         Ok(detections)
     }
@@ -1142,5 +1301,235 @@ impl Hunter {
             }
         }
         Ok(false)
+    }
+}
+
+fn parse_timespan(value: &str) -> crate::Result<Duration> {
+    let mut total = Duration::zero();
+    let mut number = String::new();
+    for character in value.trim().chars() {
+        if character.is_ascii_digit() {
+            number.push(character);
+            continue;
+        }
+        let amount = number
+            .parse::<i64>()
+            .map_err(|_| anyhow!("invalid correlation timespan '{}'", value))?;
+        number.clear();
+        total += match character {
+            's' => Duration::seconds(amount),
+            'm' => Duration::minutes(amount),
+            'h' => Duration::hours(amount),
+            'd' => Duration::days(amount),
+            'w' => Duration::weeks(amount),
+            _ => anyhow::bail!("invalid correlation timespan unit '{}'", character),
+        };
+    }
+    if !number.is_empty() {
+        anyhow::bail!("invalid correlation timespan '{}'", value);
+    }
+    if total <= Duration::zero() {
+        anyhow::bail!("correlation timespan must be positive");
+    }
+    Ok(total)
+}
+
+fn count_matches(condition: &Option<crate::rule::sigma::CorrelationCondition>, count: u64) -> bool {
+    let condition = match condition {
+        Some(condition) => condition,
+        None => return false,
+    };
+    if let Some(value) = condition.eq {
+        return count == value;
+    }
+    if let Some(value) = condition.gt {
+        return count > value;
+    }
+    if let Some(value) = condition.gte {
+        return count >= value;
+    }
+    if let Some(value) = condition.lt {
+        return count < value;
+    }
+    if let Some(value) = condition.lte {
+        return count <= value;
+    }
+    false
+}
+
+fn evaluate_correlation(
+    correlation: &CorrelationHunt,
+    mut events: Vec<CorrelationEvent>,
+) -> Option<Vec<CorrelationEvent>> {
+    if correlation.targets.is_empty()
+        || correlation.targets.len() != correlation.correlation.rules.len()
+    {
+        return None;
+    }
+    let timespan = parse_timespan(&correlation.correlation.timespan).ok()?;
+    events.sort_by_key(|event| event.timestamp);
+
+    let mut selected = HashSet::new();
+    let mut found = false;
+    for start in 0..events.len() {
+        let end = events[start].timestamp + timespan;
+        let window = (start..events.len())
+            .take_while(|index| events[*index].timestamp <= end)
+            .collect::<Vec<_>>();
+        let matches = match correlation.correlation.kind {
+            CorrelationType::EventCount => {
+                let count = window
+                    .iter()
+                    .map(|index| events[*index].document)
+                    .collect::<HashSet<_>>()
+                    .len() as u64;
+                count_matches(&correlation.correlation.condition, count)
+            }
+            CorrelationType::ValueCount => {
+                let count = window
+                    .iter()
+                    .filter_map(|index| events[*index].value.as_deref())
+                    .collect::<HashSet<_>>()
+                    .len() as u64;
+                count_matches(&correlation.correlation.condition, count)
+            }
+            CorrelationType::Temporal => {
+                let rules = window
+                    .iter()
+                    .map(|index| events[*index].rule)
+                    .collect::<HashSet<_>>();
+                correlation
+                    .targets
+                    .iter()
+                    .all(|target| rules.contains(target))
+            }
+            CorrelationType::TemporalOrdered => {
+                let mut next = 0;
+                for index in &window {
+                    if events[*index].rule == correlation.targets[next] {
+                        next += 1;
+                        if next == correlation.targets.len() {
+                            break;
+                        }
+                    }
+                }
+                next == correlation.targets.len()
+            }
+        };
+        if matches {
+            found = true;
+            selected.extend(window);
+        }
+    }
+    if !found {
+        return None;
+    }
+    Some(
+        events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, event)| selected.contains(&index).then_some(event))
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rule::sigma::CorrelationCondition;
+
+    fn timestamp(value: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").expect("invalid timestamp")
+    }
+
+    fn event(timestamp: &str, rule: Uuid, document: Uuid, value: Option<&str>) -> CorrelationEvent {
+        CorrelationEvent {
+            rule,
+            hunt: Uuid::new_v4(),
+            document,
+            timestamp: self::timestamp(timestamp),
+            value: value.map(str::to_owned),
+        }
+    }
+
+    fn correlation(
+        kind: CorrelationType,
+        targets: Vec<Uuid>,
+        condition: Option<CorrelationCondition>,
+    ) -> CorrelationHunt {
+        CorrelationHunt {
+            id: Uuid::new_v4(),
+            correlation: Correlation {
+                kind,
+                rules: targets.iter().map(|target| target.to_string()).collect(),
+                group_by: Vec::new(),
+                timespan: "5m".to_owned(),
+                condition,
+            },
+            targets,
+        }
+    }
+
+    #[test]
+    fn event_count_correlation_is_bounded_by_timespan() {
+        let rule = Uuid::new_v4();
+        let correlation = correlation(
+            CorrelationType::EventCount,
+            vec![rule],
+            Some(CorrelationCondition {
+                gte: Some(2),
+                ..Default::default()
+            }),
+        );
+        let events = vec![
+            event("2024-01-01T10:00:00", rule, Uuid::new_v4(), None),
+            event("2024-01-01T10:01:00", rule, Uuid::new_v4(), None),
+            event("2024-01-01T10:10:00", rule, Uuid::new_v4(), None),
+        ];
+
+        let selected = evaluate_correlation(&correlation, events).expect("no correlation");
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn value_count_uses_distinct_values() {
+        let rule = Uuid::new_v4();
+        let correlation = correlation(
+            CorrelationType::ValueCount,
+            vec![rule],
+            Some(CorrelationCondition {
+                field: Some("user".to_owned()),
+                gte: Some(2),
+                ..Default::default()
+            }),
+        );
+        let events = vec![
+            event("2024-01-01T10:00:00", rule, Uuid::new_v4(), Some("alice")),
+            event("2024-01-01T10:01:00", rule, Uuid::new_v4(), Some("alice")),
+            event("2024-01-01T10:02:00", rule, Uuid::new_v4(), Some("bob")),
+        ];
+
+        assert!(evaluate_correlation(&correlation, events).is_some());
+    }
+
+    #[test]
+    fn temporal_ordered_requires_sequence() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let ordered = correlation(CorrelationType::TemporalOrdered, vec![first, second], None);
+        let unordered = correlation(CorrelationType::Temporal, vec![first, second], None);
+        let events = vec![
+            event("2024-01-01T10:00:00", second, Uuid::new_v4(), None),
+            event("2024-01-01T10:01:00", first, Uuid::new_v4(), None),
+        ];
+
+        assert!(evaluate_correlation(&unordered, events.clone()).is_some());
+        assert!(evaluate_correlation(&ordered, events.clone()).is_none());
+
+        let events = vec![
+            event("2024-01-01T10:00:00", first, Uuid::new_v4(), None),
+            event("2024-01-01T10:01:00", second, Uuid::new_v4(), None),
+        ];
+        assert!(evaluate_correlation(&ordered, events).is_some());
     }
 }

@@ -1,0 +1,18 @@
+---
+title: Modifier Match
+id: modifier-match
+status: experimental
+description: Exercises numeric, CIDR, fieldref and exists modifiers.
+author: Chainsaw
+logsource:
+  product: windows
+detection:
+  selection:
+    event_id|gte: 4000
+    user|startswith: bob
+    ip|cidr: 10.1.2.0/24
+    ip|fieldref: destination
+    score|lt: 10
+    absent|exists: false
+  condition: selection
+level: high

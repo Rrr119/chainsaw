@@ -76,6 +76,62 @@ Using the `--sigma` and `--mapping` parameters you can specify a directory conta
 
 See the mapping file for the full list of fields that are used for rule detection, and feel free to extend it to your needs.
 
+#### Sigma field modifiers
+
+Chainsaw supports the commonly used Sigma field modifiers:
+
+|Modifier|Behaviour|
+|--|--|
+|`contains`, `startswith`, `endswith`|String matching with Sigma wildcard semantics|
+|`all`|Requires every value in a list to match|
+|`re`, `i`|Regular expression and case-insensitive matching|
+|`base64`, `base64offset`|Searches for encoded representations of a value|
+|`windash`|Expands Windows dash variants (`-`, `/`, and Unicode dashes)|
+|`cidr`|Matches IPv4 or IPv6 addresses within a CIDR range; lists are supported|
+|`lt`, `lte`, `gt`, `gte`|Numeric comparisons; event values are cast to integers or floats automatically|
+|`fieldref`|Compares the value of the current field with another event field|
+|`exists`|Checks whether a field is present (`true`) or absent (`false`)|
+
+For example:
+
+```yaml
+detection:
+  selection:
+    EventID|gte: 4000
+    SourceIp|cidr:
+      - 10.0.0.0/8
+      - 2001:db8::/32
+    Image|fieldref: ParentImage
+    TargetUserName|exists: false
+  condition: selection
+```
+
+#### Multi-event correlation
+
+Sigma correlation rules can reference normal Sigma rules by their `title` or `id`. Chainsaw supports `event_count`, `value_count`, `temporal`, and `temporal_ordered` correlations, optional `group-by` fields, and timespans expressed in seconds, minutes, hours, days, or weeks (`30s`, `5m`, `1h`, `1d`, `1w`). Referenced rules can be in a separate file and must be loaded during the same `hunt` invocation.
+
+```yaml
+title: Repeated Failed Logons
+id: repeated-failed-logons
+status: experimental
+description: Correlates repeated failed logons for the same user.
+author: Chainsaw
+correlation:
+  type: event_count
+  rules:
+    - Failed Logon
+  group-by:
+    - TargetUserName
+  timespan: 5m
+  condition:
+    gte: 10
+level: high
+```
+
+When a correlation matches, Chainsaw emits one detection containing every event in the matching window. Correlation state is evaluated per input file, so place related events in the same file (for example, an aggregated JSON array or JSONL file) if they need to be correlated together across channels.
+
+JSON and JSONL output also include a `context` object containing the mapped, visible fields for the matched event. For correlated detections, `context` is an array with one entry per contributing event, making it possible to inspect the values that caused the match without parsing the raw event.
+
 ### Chainsaw Detection Rules
 In addition to supporting sigma rules, Chainsaw also supports a custom rule format. In the repository you will find a `rules` directory that contains various Chainsaw rules that allows users to:
 

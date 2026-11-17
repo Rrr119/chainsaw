@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::prelude::*;
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::Result;
@@ -9,7 +10,7 @@ use base64::Engine;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Sequence, Value as Yaml};
-use tau_engine::{Document, Rule as Tau};
+use tau_engine::{Document, Rule as Tau, Value as TauValue, core::parser::Expression};
 
 use super::{Level, Status};
 
@@ -39,6 +40,12 @@ pub struct Rule {
     pub references: Option<Vec<String>>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<Correlation>,
+
+    #[serde(skip)]
+    checks: HashMap<String, FieldCheck>,
 }
 
 impl Document for Rule {
@@ -120,6 +127,344 @@ pub struct LogSource {
     pub service: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrelationType {
+    EventCount,
+    ValueCount,
+    Temporal,
+    TemporalOrdered,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CorrelationCondition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gte: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lte: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Correlation {
+    #[serde(rename = "type")]
+    pub kind: CorrelationType,
+    pub rules: Vec<String>,
+    #[serde(default, rename = "group-by")]
+    pub group_by: Vec<String>,
+    pub timespan: String,
+    #[serde(default)]
+    pub condition: Option<CorrelationCondition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FieldCheck {
+    Any { checks: Vec<FieldCheck> },
+    Exists { field: String, expected: bool },
+    FieldRef { left: String, right: String },
+    Cidr { field: String, cidr: String },
+}
+
+#[derive(Clone, Copy)]
+enum FieldCheckKind {
+    Any,
+    Exists,
+    FieldRef,
+    Cidr,
+}
+
+impl FieldCheckKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "Any",
+            Self::Exists => "Exists",
+            Self::FieldRef => "FieldRef",
+            Self::Cidr => "Cidr",
+        }
+    }
+}
+
+const CHECK_PREFIX: &str = "ChainsawSigmaCheck";
+
+fn hex_encode(value: &str) -> String {
+    value.bytes().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+impl FieldCheck {
+    pub(crate) fn key(&self) -> String {
+        let (kind, values) = match self {
+            Self::Any { checks } => (
+                FieldCheckKind::Any,
+                checks.iter().map(|check| check.key()).collect(),
+            ),
+            Self::Exists { field, expected } => (
+                FieldCheckKind::Exists,
+                vec![field.clone(), expected.to_string()],
+            ),
+            Self::FieldRef { left, right } => {
+                (FieldCheckKind::FieldRef, vec![left.clone(), right.clone()])
+            }
+            Self::Cidr { field, cidr } => (FieldCheckKind::Cidr, vec![field.clone(), cidr.clone()]),
+        };
+        let encoded = values
+            .iter()
+            .map(|value| hex_encode(value))
+            .collect::<Vec<_>>()
+            .join("z");
+        format!("{}{}{}", CHECK_PREFIX, kind.as_str(), encoded)
+    }
+
+    pub(crate) fn decode(key: &str) -> Option<Self> {
+        let encoded = key.strip_prefix(CHECK_PREFIX)?;
+        let (kind, values) = [
+            FieldCheckKind::Any,
+            FieldCheckKind::Exists,
+            FieldCheckKind::FieldRef,
+            FieldCheckKind::Cidr,
+        ]
+        .into_iter()
+        .find_map(|kind| {
+            encoded
+                .strip_prefix(kind.as_str())
+                .map(|values| (kind, values))
+        })?;
+        let values = values
+            .split('z')
+            .map(hex_decode)
+            .collect::<Option<Vec<_>>>()?;
+        match (kind, values.as_slice()) {
+            (FieldCheckKind::Any, checks) => Some(Self::Any {
+                checks: checks
+                    .iter()
+                    .map(|check| Self::decode(check))
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            (FieldCheckKind::Exists, [field, expected]) => Some(Self::Exists {
+                field: field.clone(),
+                expected: expected == "true",
+            }),
+            (FieldCheckKind::FieldRef, [left, right]) => Some(Self::FieldRef {
+                left: left.clone(),
+                right: right.clone(),
+            }),
+            (FieldCheckKind::Cidr, [field, cidr]) => Some(Self::Cidr {
+                field: field.clone(),
+                cidr: cidr.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fields(&self) -> Vec<String> {
+        match self {
+            Self::Any { checks } => checks.iter().flat_map(FieldCheck::fields).collect(),
+            Self::Exists { field, .. } | Self::Cidr { field, .. } => vec![field.clone()],
+            Self::FieldRef { left, right } => vec![left.clone(), right.clone()],
+        }
+    }
+
+    pub(crate) fn remap(&self, lookup: &HashMap<String, String>) -> Option<Self> {
+        let remap = |field: &str| lookup.get(field).cloned();
+        match self {
+            Self::Any { checks } => Some(Self::Any {
+                checks: checks
+                    .iter()
+                    .map(|check| check.remap(lookup))
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+            Self::Exists { field, expected } => Some(Self::Exists {
+                field: remap(field)?,
+                expected: *expected,
+            }),
+            Self::FieldRef { left, right } => Some(Self::FieldRef {
+                left: remap(left)?,
+                right: remap(right)?,
+            }),
+            Self::Cidr { field, cidr } => Some(Self::Cidr {
+                field: remap(field)?,
+                cidr: cidr.clone(),
+            }),
+        }
+    }
+
+    fn solve(&self, document: &dyn Document) -> bool {
+        match self {
+            Self::Any { checks } => checks.iter().any(|check| check.solve(document)),
+            Self::Exists { field, expected } => document.find(field).is_some() == *expected,
+            Self::FieldRef { left, right } => {
+                let left = document.find(left).and_then(|value| value.to_string());
+                let right = document.find(right).and_then(|value| value.to_string());
+                left.is_some() && left == right
+            }
+            Self::Cidr { field, cidr } => {
+                let address = document
+                    .find(field)
+                    .and_then(|value| value.to_string())
+                    .and_then(|value| value.parse::<IpAddr>().ok());
+                match address {
+                    Some(address) => cidr_contains(cidr, address),
+                    None => false,
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn remap_field_check_key(key: &str, lookup: &HashMap<String, String>) -> Option<String> {
+    FieldCheck::decode(key)
+        .and_then(|check| check.remap(lookup))
+        .map(|check| check.key())
+}
+
+struct SigmaDocument<'a> {
+    document: &'a dyn Document,
+    checks: &'a HashMap<String, FieldCheck>,
+}
+
+impl Document for SigmaDocument<'_> {
+    fn find(&self, key: &str) -> Option<TauValue<'_>> {
+        match self.checks.get(key) {
+            Some(check) => Some(TauValue::Bool(check.solve(self.document))),
+            None => self.document.find(key),
+        }
+    }
+}
+
+impl Rule {
+    pub(crate) fn collect_checks(&mut self) {
+        let mut checks = HashMap::new();
+        collect_checks_from_expression(&self.tau.detection.expression, &mut checks);
+        for expression in self.tau.detection.identifiers.values() {
+            collect_checks_from_expression(expression, &mut checks);
+        }
+        self.checks = checks;
+    }
+
+    pub(crate) fn remap_checks(&mut self, lookup: &HashMap<String, String>) {
+        self.checks = self
+            .checks
+            .values()
+            .filter_map(|check| check.remap(lookup))
+            .map(|check| (check.key(), check))
+            .collect();
+    }
+
+    pub(crate) fn solve(&self, document: &dyn Document) -> bool {
+        let document = SigmaDocument {
+            document,
+            checks: &self.checks,
+        };
+        tau_engine::solve(&self.tau.detection, &document)
+    }
+}
+
+fn collect_checks_from_expression(
+    expression: &Expression,
+    checks: &mut HashMap<String, FieldCheck>,
+) {
+    match expression {
+        Expression::BooleanGroup(_, expressions) => {
+            for expression in expressions {
+                collect_checks_from_expression(expression, checks);
+            }
+        }
+        Expression::BooleanExpression(left, _, right) => {
+            collect_checks_from_expression(left, checks);
+            collect_checks_from_expression(right, checks);
+        }
+        Expression::Negate(expression) => collect_checks_from_expression(expression, checks),
+        Expression::Match(_, expression) => collect_checks_from_expression(expression, checks),
+        Expression::Nested(_, expression) => collect_checks_from_expression(expression, checks),
+        Expression::Field(field) | Expression::Cast(field, _) | Expression::Search(_, field, _) => {
+            if let Some(check) = FieldCheck::decode(field) {
+                checks.insert(field.clone(), check);
+            }
+        }
+        Expression::Matrix(fields, _) => {
+            for field in fields {
+                if let Some(check) = FieldCheck::decode(field) {
+                    checks.insert(field.clone(), check);
+                }
+            }
+        }
+        Expression::Boolean(_)
+        | Expression::Float(_)
+        | Expression::Identifier(_)
+        | Expression::Integer(_)
+        | Expression::Null => {}
+    }
+}
+
+fn parse_cidr(value: &str) -> Result<(IpAddr, u8)> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| anyhow!(value.to_owned()).context("invalid cidr"))?;
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| anyhow!(value.to_owned()).context("invalid cidr address"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| anyhow!(value.to_owned()).context("invalid cidr prefix"))?;
+    let max = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max {
+        return Err(anyhow!(value.to_owned()).context("invalid cidr prefix"));
+    }
+    Ok((address, prefix))
+}
+
+fn cidr_contains(cidr: &str, address: IpAddr) -> bool {
+    let (network, prefix) = match parse_cidr(cidr) {
+        Ok(cidr) => cidr,
+        Err(_) => return false,
+    };
+    match (network, address) {
+        (IpAddr::V4(network), IpAddr::V4(address)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(network) & mask) == (u32::from(address) & mask)
+        }
+        (IpAddr::V6(network), IpAddr::V6(address)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(network) & mask) == (u128::from(address) & mask)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Deserialize)]
 struct Sigma {
     #[serde(default)]
@@ -128,6 +473,8 @@ struct Sigma {
     pub header: Option<Header>,
     #[serde(default)]
     pub level: Option<String>,
+    #[serde(default)]
+    pub correlation: Option<Correlation>,
 }
 
 impl Sigma {
@@ -330,8 +677,15 @@ lazy_static::lazy_static! {
         set.insert("all".to_owned());
         set.insert("base64".to_owned());
         set.insert("base64offset".to_owned());
+        set.insert("cidr".to_owned());
         set.insert("contains".to_owned());
         set.insert("endswith".to_owned());
+        set.insert("exists".to_owned());
+        set.insert("fieldref".to_owned());
+        set.insert("gt".to_owned());
+        set.insert("gte".to_owned());
+        set.insert("lt".to_owned());
+        set.insert("lte".to_owned());
         set.insert("startswith".to_owned());
         set.insert("re".to_owned());
         set.insert("i".to_owned());
@@ -342,6 +696,8 @@ lazy_static::lazy_static! {
 
 const MAXDASHES: usize = 5;
 const WINDASHES: [char; 5] = ['-', '/', '\u{2013}', '\u{2014}', '\u{2015}'];
+const COMPARISON_MODIFIERS: [&str; 4] = ["gt", "gte", "lt", "lte"];
+const SPECIAL_MODIFIERS: [&str; 3] = ["cidr", "exists", "fieldref"];
 
 fn build_windash_permutations(value: &str) -> Result<Vec<String>> {
     let chars: Vec<char> = value.chars().collect();
@@ -388,6 +744,79 @@ fn parse_identifier(value: &Yaml, modifiers: &HashSet<String>) -> Result<Yaml> {
     if modifiers.contains("windash") && modifiers.contains("all") {
         return Err(anyhow!("all, windash").context("unsupported modifier combination"));
     }
+    if modifiers.contains("fieldref") && value.is_mapping() {
+        return Err(anyhow!("fieldref values must be strings").context("invalid modifier"));
+    }
+    if modifiers.contains("exists") && !value.is_bool() {
+        return Err(anyhow!("exists values must be booleans").context("invalid modifier"));
+    }
+    if SPECIAL_MODIFIERS
+        .iter()
+        .filter(|modifier| modifiers.contains(**modifier))
+        .count()
+        > 1
+    {
+        return Err(anyhow!("only one of cidr, exists or fieldref may be used")
+            .context("unsupported modifier combination"));
+    }
+    if SPECIAL_MODIFIERS
+        .iter()
+        .any(|modifier| modifiers.contains(*modifier))
+        && modifiers
+            .iter()
+            .any(|modifier| !SPECIAL_MODIFIERS.contains(&modifier.as_str()) && modifier != "all")
+    {
+        return Err(anyhow!("special modifiers cannot be combined")
+            .context("unsupported modifier combination"));
+    }
+    if COMPARISON_MODIFIERS
+        .iter()
+        .filter(|modifier| modifiers.contains(**modifier))
+        .count()
+        > 1
+    {
+        return Err(anyhow!("only one comparison modifier may be used")
+            .context("unsupported modifier combination"));
+    }
+    if COMPARISON_MODIFIERS
+        .iter()
+        .any(|modifier| modifiers.contains(*modifier))
+        && modifiers.iter().any(|modifier| {
+            !COMPARISON_MODIFIERS.contains(&modifier.as_str())
+                && modifier != "all"
+                && modifier != "i"
+        })
+    {
+        return Err(anyhow!("comparison modifiers cannot be combined")
+            .context("unsupported modifier combination"));
+    }
+    if COMPARISON_MODIFIERS
+        .iter()
+        .any(|modifier| modifiers.contains(*modifier))
+        || SPECIAL_MODIFIERS
+            .iter()
+            .any(|modifier| modifiers.contains(*modifier))
+    {
+        if modifiers.contains("cidr") {
+            match value {
+                Yaml::String(value) => {
+                    parse_cidr(value)?;
+                }
+                Yaml::Sequence(values) => {
+                    for value in values {
+                        let value = value.as_str().ok_or_else(|| {
+                            anyhow!("cidr values must be strings").context("invalid modifier")
+                        })?;
+                        parse_cidr(value)?;
+                    }
+                }
+                _ => {
+                    return Err(anyhow!("cidr values must be strings").context("invalid modifier"));
+                }
+            }
+        }
+        return Ok(value.clone());
+    }
 
     let v = match value {
         Yaml::Mapping(m) => {
@@ -409,7 +838,7 @@ fn parse_identifier(value: &Yaml, modifiers: &HashSet<String>) -> Result<Yaml> {
             Yaml::Sequence(scratch)
         }
         Yaml::String(s) => {
-            let s = if modifiers.contains("base64") {
+            if modifiers.contains("base64") {
                 let mut remaining = modifiers.clone();
                 let _ = remaining.remove("base64");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(s);
@@ -494,12 +923,116 @@ fn parse_identifier(value: &Yaml, modifiers: &HashSet<String>) -> Result<Yaml> {
                     }
                 };
                 Yaml::String(s)
-            };
-            s
+            }
         }
         _ => value.clone(),
     };
     Ok(v)
+}
+
+fn field_checks(field: &str, value: &Yaml, modifiers: &HashSet<String>) -> Result<Vec<FieldCheck>> {
+    if modifiers.contains("fieldref") {
+        let targets = match value {
+            Yaml::String(target) => vec![target.as_str()],
+            Yaml::Sequence(targets) => targets
+                .iter()
+                .map(|target| {
+                    target
+                        .as_str()
+                        .ok_or_else(|| anyhow!("fieldref values must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => return Err(anyhow!("fieldref values must be strings")),
+        };
+        return Ok(targets
+            .into_iter()
+            .map(|target| FieldCheck::FieldRef {
+                left: field.to_owned(),
+                right: target.to_owned(),
+            })
+            .collect());
+    }
+    if modifiers.contains("exists") {
+        let expected = value
+            .as_bool()
+            .ok_or_else(|| anyhow!("exists values must be booleans"))?;
+        return Ok(vec![FieldCheck::Exists {
+            field: field.to_owned(),
+            expected,
+        }]);
+    }
+    if modifiers.contains("cidr") {
+        let values = match value {
+            Yaml::String(cidr) => vec![cidr.as_str()],
+            Yaml::Sequence(values) => values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| anyhow!("cidr values must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => return Err(anyhow!("cidr values must be strings")),
+        };
+        let mut checks = Vec::with_capacity(values.len());
+        for cidr in values {
+            parse_cidr(cidr)?;
+            checks.push(FieldCheck::Cidr {
+                field: field.to_owned(),
+                cidr: cidr.to_owned(),
+            });
+        }
+        return Ok(checks);
+    }
+    Ok(Vec::new())
+}
+
+fn comparison_modifier(modifiers: &HashSet<String>) -> Option<&'static str> {
+    COMPARISON_MODIFIERS
+        .iter()
+        .find(|modifier| modifiers.contains(**modifier))
+        .copied()
+}
+
+fn comparison_value(value: &Yaml, operator: &str) -> Result<Yaml> {
+    let operator = match operator {
+        "gt" => ">",
+        "gte" => ">=",
+        "lt" => "<",
+        "lte" => "<=",
+        _ => return Err(anyhow!("invalid comparison modifier")),
+    };
+    match value {
+        Yaml::Number(number) => {
+            if number.as_i64().is_some() || number.as_f64().is_some() {
+                Ok(Yaml::String(format!("{}{}", operator, number)))
+            } else {
+                Err(anyhow!("comparison values must be numeric"))
+            }
+        }
+        Yaml::String(value) => {
+            value
+                .parse::<f64>()
+                .map_err(|_| anyhow!("comparison values must be numeric"))?;
+            Ok(Yaml::String(format!("{}{}", operator, value)))
+        }
+        Yaml::Sequence(values) => values
+            .iter()
+            .map(|value| comparison_value(value, operator))
+            .collect::<Result<Vec<_>>>()
+            .map(Yaml::Sequence),
+        _ => Err(anyhow!("comparison values must be numeric")),
+    }
+}
+
+fn comparison_cast(value: &Yaml) -> &'static str {
+    let is_float = match value {
+        Yaml::Number(number) => number.as_i64().is_none() && number.as_f64().is_some(),
+        Yaml::String(value) => value.contains('.'),
+        Yaml::Sequence(values) => values.iter().any(|value| comparison_cast(value) == "flt"),
+        _ => false,
+    };
+    if is_float { "flt" } else { "int" }
 }
 
 fn prepare_condition(condition: &str) -> Result<(String, Option<Aggregate>)> {
@@ -698,6 +1231,26 @@ fn detections_to_tau(detection: Detection) -> Result<Mapping> {
                         }
                         seen.insert(f.clone());
                         let modifiers: HashSet<String> = it.map(|s| s.to_string()).collect();
+                        let checks = field_checks(&f, v, &modifiers)?;
+                        if !checks.is_empty() {
+                            let check = if checks.len() == 1 {
+                                checks.into_iter().next().expect("missing field check")
+                            } else {
+                                FieldCheck::Any { checks }
+                            };
+                            let mut map = Mapping::new();
+                            map.insert(check.key().into(), Yaml::Bool(true));
+                            maps.push(map);
+                            continue;
+                        }
+                        if let Some(operator) = comparison_modifier(&modifiers) {
+                            let value = comparison_value(v, operator)?;
+                            f = format!("{}({})", comparison_cast(v), f);
+                            let mut map = Mapping::new();
+                            map.insert(f.into(), value);
+                            maps.push(map);
+                            continue;
+                        }
                         if modifiers.contains("all") {
                             f = format!("all({})", f);
                         }
@@ -759,6 +1312,26 @@ fn detections_to_tau(detection: Detection) -> Result<Mapping> {
                     }
                     seen.insert(f.clone());
                     let modifiers: HashSet<String> = it.map(|s| s.to_string()).collect();
+                    let checks = field_checks(&f, &v, &modifiers)?;
+                    if !checks.is_empty() {
+                        let check = if checks.len() == 1 {
+                            checks.into_iter().next().expect("missing field check")
+                        } else {
+                            FieldCheck::Any { checks }
+                        };
+                        let mut map = Mapping::new();
+                        map.insert(check.key().into(), Yaml::Bool(true));
+                        maps.push(map);
+                        continue;
+                    }
+                    if let Some(operator) = comparison_modifier(&modifiers) {
+                        let value = comparison_value(&v, operator)?;
+                        f = format!("{}({})", comparison_cast(&v), f);
+                        let mut map = Mapping::new();
+                        map.insert(f.into(), value);
+                        maps.push(map);
+                        continue;
+                    }
                     if modifiers.contains("all") {
                         f = format!("all({})", f);
                     }
@@ -953,6 +1526,9 @@ pub fn load(rule: &Path) -> Result<Vec<Yaml>> {
         Some(base) => base,
         None => bail!("failed to parse sigma rule"),
     };
+    let correlation = main.correlation.clone();
+    let correlation_base = main.as_base();
+    let correlation_level = main.level.clone();
 
     let mut rules = vec![];
 
@@ -1048,6 +1624,36 @@ pub fn load(rule: &Path) -> Result<Vec<Yaml>> {
             }
             rules.push(rule.into());
         }
+    }
+
+    if let Some(correlation) = correlation {
+        let mut rule =
+            correlation_base.ok_or_else(|| anyhow!("failed to parse sigma correlation rule"))?;
+        let level = match correlation_level.as_deref() {
+            Some("critical" | "high" | "medium" | "low") => correlation_level.unwrap(),
+            _ => "info".to_owned(),
+        };
+        rule.insert("level".into(), level.into());
+
+        let mut detection = Mapping::new();
+        let mut identifier = Mapping::new();
+        identifier.insert(
+            "ChainsawCorrelationPlaceholder".into(),
+            Yaml::String("ChainsawCorrelationPlaceholderValue".into()),
+        );
+        detection.insert("ChainsawCorrelationPlaceholder".into(), identifier.into());
+        detection.insert(
+            "condition".into(),
+            "ChainsawCorrelationPlaceholder and not ChainsawCorrelationPlaceholder".into(),
+        );
+        rule.insert("detection".into(), detection.into());
+        rule.insert("true_positives".into(), Sequence::new().into());
+        rule.insert("true_negatives".into(), Sequence::new().into());
+        rule.insert(
+            "correlation".into(),
+            serde_yaml::to_value(correlation).expect("could not serialise correlation"),
+        );
+        rules.push(rule.into());
     }
 
     Ok(rules)
@@ -1508,5 +2114,120 @@ mod tests {
         let detection: Detection = serde_yaml::from_str(detection).unwrap();
         let detection = detections_to_tau(detection).unwrap();
         assert_eq!(detection, *expected.as_mapping().unwrap());
+    }
+
+    #[test]
+    fn test_comparison_and_special_modifiers() {
+        let detection = r#"
+            selection:
+                Port|gte: 1024
+                Score|lt: 5.5
+                Present|exists: false
+                Internal|fieldref: Destination
+                SourceIp|cidr: 10.0.0.0/8
+                AlternateIp|cidr:
+                    - 192.168.0.0/16
+                    - 172.16.0.0/12
+            condition: selection
+        "#;
+        let detection: Detection = serde_yaml::from_str(detection).unwrap();
+        let detection = detections_to_tau(detection).unwrap();
+        let selection = detection
+            .get("detection")
+            .and_then(Yaml::as_mapping)
+            .and_then(|detection| detection.get("selection"))
+            .and_then(Yaml::as_mapping)
+            .expect("missing selection");
+
+        assert_eq!(
+            selection
+                .get("int(Port)")
+                .and_then(Yaml::as_str)
+                .expect("missing integer comparison"),
+            ">=1024"
+        );
+        assert_eq!(
+            selection
+                .get("flt(Score)")
+                .and_then(Yaml::as_str)
+                .expect("missing float comparison"),
+            "<5.5"
+        );
+
+        let checks = selection
+            .keys()
+            .filter_map(Yaml::as_str)
+            .filter_map(FieldCheck::decode)
+            .collect::<Vec<_>>();
+        assert!(checks.contains(&FieldCheck::Exists {
+            field: "Present".into(),
+            expected: false,
+        }));
+        assert!(checks.contains(&FieldCheck::FieldRef {
+            left: "Internal".into(),
+            right: "Destination".into(),
+        }));
+        assert!(checks.contains(&FieldCheck::Cidr {
+            field: "SourceIp".into(),
+            cidr: "10.0.0.0/8".into(),
+        }));
+        assert!(checks.iter().any(|check| matches!(
+            check,
+            FieldCheck::Any { checks }
+                if checks.contains(&FieldCheck::Cidr {
+                    field: "AlternateIp".into(),
+                    cidr: "172.16.0.0/12".into(),
+                })
+        )));
+
+        let tau: Tau = serde_yaml::from_value(Yaml::Mapping(detection))
+            .expect("special modifier rule did not parse");
+        struct Doc;
+        impl Document for Doc {
+            fn find(&self, key: &str) -> Option<TauValue<'_>> {
+                match key {
+                    "Port" => Some(TauValue::String(Cow::Borrowed("1024"))),
+                    "Score" => Some(TauValue::String(Cow::Borrowed("5.0"))),
+                    "Internal" => Some(TauValue::String(Cow::Borrowed("server-1"))),
+                    "Destination" => Some(TauValue::String(Cow::Borrowed("server-1"))),
+                    "SourceIp" => Some(TauValue::String(Cow::Borrowed("10.20.30.40"))),
+                    "AlternateIp" => Some(TauValue::String(Cow::Borrowed("172.20.0.1"))),
+                    _ => None,
+                }
+            }
+        }
+        let mut field_checks = HashMap::new();
+        collect_checks_from_expression(&tau.detection.expression, &mut field_checks);
+        for expression in tau.detection.identifiers.values() {
+            collect_checks_from_expression(expression, &mut field_checks);
+        }
+        let document = SigmaDocument {
+            document: &Doc,
+            checks: &field_checks,
+        };
+        for check in field_checks.values() {
+            assert!(check.solve(&Doc), "field check failed: {:?}", check);
+        }
+        assert!(tau_engine::solve(&tau.detection, &document));
+    }
+
+    #[test]
+    fn test_cidr_contains() {
+        assert!(cidr_contains(
+            "10.0.0.0/8",
+            "10.20.30.40".parse().expect("invalid ip")
+        ));
+        assert!(!cidr_contains(
+            "10.0.0.0/8",
+            "192.168.1.10".parse().expect("invalid ip")
+        ));
+        assert!(cidr_contains(
+            "2001:db8::/32",
+            "2001:db8:1::1".parse().expect("invalid ip")
+        ));
+        assert!(!cidr_contains(
+            "2001:db8::/32",
+            "2001:db9::1".parse().expect("invalid ip")
+        ));
     }
 }

@@ -1,0 +1,16 @@
+---
+title: Repeated Failed Logons
+id: repeated-failed-logons
+status: experimental
+description: Correlates repeated failed logons for the same user.
+author: Chainsaw
+correlation:
+  type: event_count
+  rules:
+    - Failed Logon
+  group-by:
+    - user
+  timespan: 5m
+  condition:
+    gte: 2
+level: medium

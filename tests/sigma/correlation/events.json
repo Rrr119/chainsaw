@@ -1,0 +1,6 @@
+[
+  {"timestamp":"2024-01-01T10:00:00Z","user":"bob","event_id":4625,"ip":"10.1.2.3"},
+  {"timestamp":"2024-01-01T10:01:00Z","user":"bob","event_id":4625,"ip":"10.1.2.4"},
+  {"timestamp":"2024-01-01T10:10:00Z","user":"bob","event_id":4625,"ip":"10.1.2.5"},
+  {"timestamp":"2024-01-01T10:00:30Z","user":"alice","event_id":4625,"ip":"10.1.2.6"}
+]

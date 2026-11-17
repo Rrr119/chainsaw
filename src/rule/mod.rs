@@ -74,7 +74,7 @@ impl Rule {
                 Filter::Detection(detection) => tau_engine::solve(detection, document),
                 Filter::Expression(expression) => tau_engine::core::solve(expression, document),
             },
-            Self::Sigma(s) => tau_engine::solve(&s.tau.detection, document),
+            Self::Sigma(s) => s.solve(document),
         }
     }
 
@@ -247,6 +247,7 @@ pub fn load(
                     s.tau.detection.identifiers.clear();
                     s.tau.detection.expression = optimiser::shake(s.tau.detection.expression);
                     s.tau.detection.expression = optimiser::rewrite(s.tau.detection.expression);
+                    s.collect_checks();
                     // FIXME: Off until matrix optimisation is fixed upstream.
                     //s.tau.detection.expression = optimiser::matrix(s.tau.detection.expression);
                     Rule::Sigma(s)

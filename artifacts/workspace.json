@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid23352",
+  "B": "/home/dev/feedback/uid23352",
+  "sha": "76a4d6f2e4d7fd3614686abf2db6817f50776467",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "WithSecureLabs",
+    "repo": "chainsaw",
+    "sha": "76a4d6f2e4d7fd3614686abf2db6817f50776467"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "chainsaw",
+    "cloneUrl": "https://github.com/Rrr119/chainsaw.git"
+  },
+  "at": "2026-11-17T16:02:12.214Z"
+}

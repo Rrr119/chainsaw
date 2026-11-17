@@ -982,6 +982,8 @@ pub struct Detection<'a> {
     pub group: &'a String,
     #[serde(flatten)]
     pub kind: &'a Kind<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Json>,
     pub name: &'a String,
     pub timestamp: String,
 
@@ -1006,6 +1008,54 @@ pub struct Sigma<'a> {
     pub references: &'a Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: &'a Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation: &'a Option<crate::rule::sigma::Correlation>,
+}
+
+fn context_for_document(hunt: &Hunt, document: &crate::hunt::Document<'_>) -> crate::Result<Json> {
+    let data: Value;
+    (data, _) =
+        bincode::serde::decode_from_slice::<Value, _>(&document.data, bincode::config::standard())?;
+    let wrapper;
+    let mapped = match &document.kind {
+        FileKind::Evtx => {
+            wrapper = crate::evtx::Wrapper(&data);
+            hunt.mapper.mapped(&wrapper)
+        }
+        FileKind::Hve
+        | FileKind::Esedb
+        | FileKind::Json
+        | FileKind::Jsonl
+        | FileKind::Mft
+        | FileKind::Xml => hunt.mapper.mapped(&data),
+        FileKind::Unknown => return Ok(Json::Null),
+    };
+    Ok(context_from_mapped(hunt.mapper.fields(), mapped))
+}
+
+fn context_from_mapped(fields: &[crate::rule::chainsaw::Field], mapped: impl Document) -> Json {
+    let mut context = Map::new();
+    for field in fields {
+        if field.visible
+            && let Some(value) = mapped.find(&field.from)
+        {
+            context.insert(field.name.clone(), tau_to_json(value));
+        }
+    }
+    Json::Object(context)
+}
+
+fn context_for_kind(hunt: &Hunt, kind: &Kind<'_>) -> crate::Result<Option<Json>> {
+    match kind {
+        Kind::Individual { document } => Ok(Some(context_for_document(hunt, document)?)),
+        Kind::Aggregate { documents } => Ok(Some(Json::Array(
+            documents
+                .iter()
+                .map(|document| context_for_document(hunt, document))
+                .collect::<crate::Result<Vec<_>>>()?,
+        ))),
+        Kind::Cached { .. } => Ok(None),
+    }
 }
 
 pub fn print_json(
@@ -1016,59 +1066,60 @@ pub fn print_json(
     timezone: Option<Tz>,
 ) -> crate::Result<()> {
     let hunts: HashMap<_, _> = hunts.iter().map(|h| (&h.id, h)).collect();
-    let mut detections = detections
-        .iter()
-        .flat_map(|d| {
-            let mut detections = Vec::with_capacity(d.hits.len());
-            for hit in &d.hits {
-                let hunt = hunts.get(&hit.hunt).expect("could not get rule!");
-                let rule = rules.get(&hit.rule).expect("could not get rule!");
-                let localised = if let Some(timezone) = timezone {
-                    timezone.from_utc_datetime(&hit.timestamp).to_rfc3339()
-                } else if local {
-                    Local.from_utc_datetime(&hit.timestamp).to_rfc3339()
-                } else {
-                    Utc.from_utc_datetime(&hit.timestamp).to_rfc3339()
-                };
-                match rule {
-                    Rule::Chainsaw(c) => detections.push(Detection {
-                        authors: &c.authors,
+    let mut output = Vec::new();
+    for detection in detections {
+        for hit in &detection.hits {
+            let hunt = hunts.get(&hit.hunt).expect("could not get rule!");
+            let rule = rules.get(&hit.rule).expect("could not get rule!");
+            let localised = if let Some(timezone) = timezone {
+                timezone.from_utc_datetime(&hit.timestamp).to_rfc3339()
+            } else if local {
+                Local.from_utc_datetime(&hit.timestamp).to_rfc3339()
+            } else {
+                Utc.from_utc_datetime(&hit.timestamp).to_rfc3339()
+            };
+            let context = context_for_kind(hunt, &detection.kind)?;
+            match rule {
+                Rule::Chainsaw(c) => output.push(Detection {
+                    authors: &c.authors,
+                    context,
+                    group: &hunt.group,
+                    kind: &detection.kind,
+                    level: &c.level,
+                    name: &c.name,
+                    source: RuleKind::Chainsaw,
+                    status: &c.status,
+                    timestamp: localised,
+
+                    sigma: None,
+                }),
+                Rule::Sigma(s) => {
+                    let sigma = Sigma {
+                        falsepositives: &s.falsepositives,
+                        id: &s.id,
+                        logsource: &s.logsource,
+                        references: &s.references,
+                        tags: &s.tags,
+                        correlation: &s.correlation,
+                    };
+                    output.push(Detection {
+                        authors: &s.authors,
+                        context,
                         group: &hunt.group,
-                        kind: &d.kind,
-                        level: &c.level,
-                        name: &c.name,
-                        source: RuleKind::Chainsaw,
-                        status: &c.status,
+                        kind: &detection.kind,
+                        level: &s.level,
+                        name: &s.name,
+                        source: RuleKind::Sigma,
+                        status: &s.status,
                         timestamp: localised,
 
-                        sigma: None,
-                    }),
-                    Rule::Sigma(s) => {
-                        let sigma = Sigma {
-                            falsepositives: &s.falsepositives,
-                            id: &s.id,
-                            logsource: &s.logsource,
-                            references: &s.references,
-                            tags: &s.tags,
-                        };
-                        detections.push(Detection {
-                            authors: &s.authors,
-                            group: &hunt.group,
-                            kind: &d.kind,
-                            level: &s.level,
-                            name: &s.name,
-                            source: RuleKind::Sigma,
-                            status: &s.status,
-                            timestamp: localised,
-
-                            sigma: Some(sigma),
-                        })
-                    }
+                        sigma: Some(sigma),
+                    })
                 }
             }
-            detections
-        })
-        .collect::<Vec<Detection>>();
+        }
+    }
+    let mut detections = output;
     detections.sort_by(|x, y| x.timestamp.cmp(&y.timestamp));
     cs_print_json!(&detections)?;
     Ok(())
@@ -1107,9 +1158,11 @@ pub fn print_jsonl(
         for (localised, hit, d) in hits {
             let hunt = hunts.get(&hit.hunt).expect("could not get rule!");
             let rule = rules.get(&hit.rule).expect("could not get rule!");
+            let context = context_for_kind(hunt, &d.kind)?;
             let det = match rule {
                 Rule::Chainsaw(c) => Detection {
                     authors: &c.authors,
+                    context,
                     group: &hunt.group,
                     kind: &d.kind,
                     level: &c.level,
@@ -1127,9 +1180,11 @@ pub fn print_jsonl(
                         logsource: &s.logsource,
                         references: &s.references,
                         tags: &s.tags,
+                        correlation: &s.correlation,
                     };
                     Detection {
                         authors: &s.authors,
+                        context,
                         group: &hunt.group,
                         kind: &d.kind,
                         level: &s.level,
@@ -1153,6 +1208,20 @@ pub fn print_jsonl(
                     f.read_exact(&mut buf).expect("could not read cached data");
                     let data = String::from_utf8(buf).expect("could not convert cached data");
                     let raw = RawValue::from_string(data).expect("could not serialize cached data");
+                    let context = serde_json::from_str::<Json>(raw.get())
+                        .ok()
+                        .map(Value::from)
+                        .map(|value| {
+                            let wrapper;
+                            let mapped = match document.kind {
+                                FileKind::Evtx => {
+                                    wrapper = crate::evtx::Wrapper(&value);
+                                    hunt.mapper.mapped(&wrapper)
+                                }
+                                _ => hunt.mapper.mapped(&value),
+                            };
+                            context_from_mapped(hunt.mapper.fields(), mapped)
+                        });
                     let kind = Kind::Cached {
                         document: crate::hunt::RawDocument {
                             kind: document.kind.clone(),
@@ -1165,6 +1234,7 @@ pub fn print_jsonl(
 
                     cs_print_json!(&Detection {
                         authors: det.authors,
+                        context,
                         group: det.group,
                         kind: &kind,
                         level: det.level,
@@ -1185,9 +1255,11 @@ pub fn print_jsonl(
         for (localised, hit, d) in hits {
             let hunt = hunts.get(&hit.hunt).expect("could not get rule!");
             let rule = rules.get(&hit.rule).expect("could not get rule!");
+            let context = context_for_kind(hunt, &d.kind)?;
             let det = match rule {
                 Rule::Chainsaw(c) => Detection {
                     authors: &c.authors,
+                    context,
                     group: &hunt.group,
                     kind: &d.kind,
                     level: &c.level,
@@ -1205,9 +1277,11 @@ pub fn print_jsonl(
                         logsource: &s.logsource,
                         references: &s.references,
                         tags: &s.tags,
+                        correlation: &s.correlation,
                     };
                     Detection {
                         authors: &s.authors,
+                        context,
                         group: &hunt.group,
                         kind: &d.kind,
                         level: &s.level,

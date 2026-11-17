@@ -1,0 +1,22 @@
+---
+name: Sigma correlation test mapping
+kind: json
+rules: sigma
+groups:
+  - name: Sigma
+    timestamp: timestamp
+    filter:
+      user: "*"
+    fields:
+      - name: Timestamp
+        from: timestamp
+        to: timestamp
+      - name: User
+        from: user
+        to: user
+      - name: Event ID
+        from: event_id
+        to: event_id
+      - name: Source IP
+        from: ip
+        to: ip

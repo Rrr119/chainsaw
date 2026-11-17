@@ -1,0 +1,15 @@
+---
+title: Failed Logon
+id: failed-logon
+status: experimental
+description: Matches failed logons for a test user.
+author: Chainsaw
+logsource:
+  product: windows
+  service: security
+detection:
+  selection:
+    event_id: 4625
+    user|contains: bob
+  condition: selection
+level: low

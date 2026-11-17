@@ -7,6 +7,8 @@ use tau_engine::core::parser::{
     BoolSym, Expression, IdentifierParser, MatchType, ModSym, Pattern, Search, parse_identifier,
 };
 
+use crate::rule::sigma::FieldCheck;
+
 pub fn deserialize_expression<'de, D>(deserializer: D) -> Result<Expression, D::Error>
 where
     D: de::Deserializer<'de>,
@@ -37,6 +39,12 @@ where
 
 pub fn extract_fields(expression: &Expression) -> HashSet<String> {
     let mut set = HashSet::new();
+    let insert = |set: &mut HashSet<String>, field: &str| match FieldCheck::decode(field) {
+        Some(check) => set.extend(check.fields()),
+        None => {
+            set.insert(field.to_owned());
+        }
+    };
     match expression {
         Expression::BooleanGroup(_, expressions) => {
             for expression in expressions {
@@ -48,27 +56,27 @@ pub fn extract_fields(expression: &Expression) -> HashSet<String> {
             set.extend(extract_fields(right));
         }
         Expression::Cast(s, _) => {
-            set.insert(s.to_owned());
+            insert(&mut set, s);
         }
         Expression::Field(f) => {
-            set.insert(f.to_owned());
+            insert(&mut set, f);
         }
         Expression::Match(_, e) => {
             set.extend(extract_fields(e));
         }
         Expression::Matrix(fields, _) => {
             for field in fields {
-                set.insert(field.to_owned());
+                insert(&mut set, field);
             }
         }
         Expression::Negate(e) => {
             set.extend(extract_fields(e));
         }
         Expression::Nested(field, _) => {
-            set.insert(field.to_owned());
+            insert(&mut set, field);
         }
         Expression::Search(_, field, _) => {
-            set.insert(field.to_owned());
+            insert(&mut set, field);
         }
         Expression::Boolean(_)
         | Expression::Float(_)
@@ -80,6 +88,17 @@ pub fn extract_fields(expression: &Expression) -> HashSet<String> {
 }
 
 pub fn update_fields(expression: Expression, lookup: &HashMap<String, String>) -> Expression {
+    let remap = |field: &str| {
+        if FieldCheck::decode(field).is_some() {
+            crate::rule::sigma::remap_field_check_key(field, lookup)
+                .expect("could not remap sigma field check")
+        } else {
+            lookup
+                .get(field)
+                .unwrap_or_else(|| panic!("could not get field - {}", field))
+                .to_owned()
+        }
+    };
     match expression {
         Expression::BooleanGroup(x, expressions) => {
             let expressions = expressions
@@ -93,32 +112,16 @@ pub fn update_fields(expression: Expression, lookup: &HashMap<String, String>) -
             x,
             Box::new(update_fields(*right, lookup)),
         ),
-        Expression::Cast(field, x) => {
-            let field = lookup.get(&field).expect("could not get field");
-            Expression::Cast(field.to_owned(), x)
-        }
-        Expression::Field(field) => {
-            let field = lookup.get(&field).expect("could not get field");
-            Expression::Field(field.to_owned())
-        }
+        Expression::Cast(field, x) => Expression::Cast(remap(&field), x),
+        Expression::Field(field) => Expression::Field(remap(&field)),
         Expression::Match(x, e) => Expression::Match(x, Box::new(update_fields(*e, lookup))),
         Expression::Matrix(fields, x) => {
-            let fields = fields
-                .into_iter()
-                .map(|f| lookup.get(&f).expect("could not get field"))
-                .cloned()
-                .collect();
+            let fields = fields.into_iter().map(|field| remap(&field)).collect();
             Expression::Matrix(fields, x)
         }
         Expression::Negate(e) => Expression::Negate(Box::new(update_fields(*e, lookup))),
-        Expression::Nested(field, x) => {
-            let field = lookup.get(&field).expect("could not get field");
-            Expression::Nested(field.to_owned(), x)
-        }
-        Expression::Search(x, field, y) => {
-            let field = lookup.get(&field).expect("could not get field");
-            Expression::Search(x, field.to_owned(), y)
-        }
+        Expression::Nested(field, x) => Expression::Nested(remap(&field), x),
+        Expression::Search(x, field, y) => Expression::Search(x, remap(&field), y),
         Expression::Boolean(_)
         | Expression::Float(_)
         | Expression::Identifier(_)
